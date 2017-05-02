@@ -1,0 +1,333 @@
+<?php
+
+/**
+ * @file
+ * Implements ArCa payment(https://arca.am) services for use with Drupal Commerce.
+ */
+
+// Include helper file.
+module_load_include('inc', 'commerce_arca', 'includes/commerce_arca');
+
+define('COMMERCE_ARCA_CURRENCY', 'AMD');
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_arca_menu() {
+  $items = array();
+
+  // Callback path for arca server.
+  $items['commerce_arca/%commerce_payment_method_instance'] = array(
+    'page callback' => 'commerce_arca_process_payment',
+    'page arguments' => array(1),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Processes an incoming query from arca.
+ *
+ * @param $payment_method
+ *   The payment method instance array that originally made the payment.
+ *
+ * @return
+ *   TRUE or FALSE indicating whether the payment query was successfully processed or not.
+ */
+function commerce_arca_process_payment($payment_method = NULL) {
+  if (is_null($payment_method)) {
+    return FALSE;
+  }
+
+  $callback = $payment_method['base'] . '_process_payment';
+  // If callback function existed...
+  if (function_exists($callback)) {
+    return $callback($payment_method);
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_arca_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['arca_ipay'] = array(
+    'base' => 'commerce_arca_ipay',
+    'title' => t('ArCa IPay'),
+    'short_title' => t('ArCa'),
+    'description' => t('Armenian Card IPay payment method'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Returns the default settings for the ArCa IPay payment method.
+ */
+function commerce_arca_ipay_default_settings() {
+  return array(
+    'api_url' => '',
+    'api_login' => '',
+    'api_password' => '',
+    'test_mode' => 1,
+    'payment_method_title' => t('ArCa IPay'),
+  );
+}
+
+/**
+ * Payment method callback: settings form.
+ */
+function commerce_arca_ipay_settings_form($settings = array()) {
+  $form = array();
+
+  // Merge default settings into the stored settings array.
+  $settings = (array) $settings + commerce_arca_ipay_default_settings();
+
+  $form['api_url'] = array(
+    '#type' => 'textfield',
+    '#title' => t('ArCa IPay API url'),
+    '#description' => t('The rest API url for making transactions.'),
+    '#default_value' => $settings['api_url'],
+    '#required' => TRUE,
+  );
+
+  $form['api_login'] = array(
+    '#type' => 'textfield',
+    '#title' => t('ArCa IPay API login'),
+    '#default_value' => $settings['api_login'],
+    '#required' => TRUE,
+  );
+
+  $form['api_password'] = array(
+    '#type' => 'textfield',
+    '#title' => t('ArCa IPay API password'),
+    '#default_value' => $settings['api_password'],
+    '#required' => TRUE,
+  );
+
+  $form['test_mode'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Test mode'),
+    '#default_value' => $settings['test_mode'],
+    '#description' => t('Wheather the rest api is for testing or not.'),
+  );
+
+  $form['payment_method_title'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Title in payment methods listing'),
+    '#default_value' => $settings['payment_method_title'],
+    '#required' => TRUE,
+  );
+
+  return $form;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function commerce_arca_form_commerce_checkout_form_alter(&$form, &$form_state) {
+  // If this checkout form contains the payment method radios...
+  if (!empty($form['commerce_payment']['payment_method']['#options'])) {
+    // Loop over its options array looking for a ArCa IPay option.
+    foreach ($form['commerce_payment']['payment_method']['#options'] as $key => &$value) {
+      list($method_id, $rule_name) = explode('|', $key);
+
+      // If we find ArCa IPay...
+      if ($method_id == 'arca_ipay') {
+        $settings = $form['commerce_payment']['payment_methods']['#value'][$key]['settings'];
+
+        // Prepare the replacement radio button text with icons.
+        $value = t('!title', array(
+          '!title' => $settings['payment_method_title'],
+        ));
+
+        // Currently Commerce Order only works for AMD currency.
+        $order = $form_state['order'];
+        if ($order->commerce_order_total[LANGUAGE_NONE][0]['currency_code'] != COMMERCE_ARCA_CURRENCY) {
+          drupal_add_js('jQuery(document).ready(function () {
+            jQuery("#edit-commerce-payment-payment-method-arca-ipaycommerce-payment-arca-ipay").attr("disabled", "disabled");
+          });', 'inline');
+
+          drupal_set_message(t('Currently Commerce ArCa supports only AMD currency.'));
+        }
+
+        if (isset($_SESSION['arca_payment_error'])) {
+          drupal_set_message(t('!error_message', array(
+            '!error_message' => $_SESSION['arca_payment_error'],
+          )), 'error');
+          unset($_SESSION['arca_payment_error']);
+        }
+
+        break;
+      }
+    }
+  }
+}
+
+/**
+ * Payment method callback: redirect form, a wrapper around the module's general
+ *   use function for building a refirect form.
+ */
+function commerce_arca_ipay_redirect_form($form, &$form_state, $order, $payment_method) {
+  $form = array(
+    '#method' => 'get',
+  );
+  $error_message = 'Redirect to ArCa Checkout failed. Please try again later.';
+
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  $amount = $wrapper->commerce_order_total->amount->value();
+
+  /*
+   * Currency code according to ISO 4217 standard (https://en.wikipedia.org/wiki/ISO_4217)
+   * Currently only for AMD (Armenian dram)
+   */
+  $currency_number = '051';
+
+  // If previously has been made query to arca then increment orderNumber to prevent error.
+  if (isset($order->data['arca_ipay']['orderNumber'])) {
+    $order_number = $order->data['arca_ipay']['orderNumber'];
+
+    $i = explode('-', $order_number);
+    $i[1]++;
+
+    $order_number = $i[0] . '-' . $i[1];
+  }
+  else {
+    $order_number = $order->order_id . '-' . 1;
+  }
+
+  // Collect data for sending http request to arca server.
+  $data = array(
+    'orderNumber' => $order_number,
+    'amount' => $amount,
+    'currency' => $currency_number,
+
+    // Return to the payment redirect page for processing payments.
+    'returnUrl' => _commerce_arca_return_url($payment_method['instance_id']),
+  );
+
+  // Allow modules to alter parameters of the API request.
+  drupal_alter('commerce_arca_ipay_order_form_data', $data, $order);
+
+  // Register order in arca.
+  $result = _commerce_arca_ipay_make_request('register', $data);
+
+  if (!is_null($result)) {
+    // Order has been successfully registered.
+    if ($result->errorCode == 0) {
+      // Save information retrieved from arca to $order.
+      $order->data['arca_ipay'] = array(
+        'orderNumber' => $data['orderNumber'],
+      );
+      commerce_order_save($order);
+
+      _commerce_arca_ipay_add_redirect_url($form, $result->formUrl);
+    }
+    else {
+      $error_message = $result->errorMessage;
+    }
+  }
+
+  // If for some reasons there is no #action which means it couldn't be redirected to arca.
+  if (!isset($form['#action'])) {
+    commerce_payment_redirect_pane_previous_page($order, $error_message);
+    $_SESSION['arca_payment_error'] = $error_message;
+  }
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Proceed to ArCa'),
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: process an arca ipay query.
+ *
+ * @return
+ *   TRUE or FALSE indicating whether the payment query was successfully processed or not.
+ */
+function commerce_arca_ipay_process_payment($payment_method) {
+  if (!isset($_GET['orderId'])) {
+    return FALSE;
+  }
+
+  $order_id_arca = $_GET['orderId'];
+
+  $order_arca = _commerce_arca_ipay_make_request('getOrderStatus', array(
+    'orderId' => $order_id_arca,
+  ));
+  if (isset($order_arca->OrderStatus)) {
+    $order_id = $order_arca->OrderNumber;
+    $order_id = explode('-', $order_id);
+
+    // Get order id from OrderNumber returned by arca.
+    if (!ctype_digit($order_id[0])) {
+      return FALSE;
+    }
+    else {
+      $order_id = $order_id[0];
+    }
+
+    $order = commerce_order_load($order_id);
+    $transaction = commerce_payment_transaction_new('arca_ipay', $order->order_id);
+    $transaction->instance_id = $payment_method['instance_id'];
+
+    $success = FALSE;
+
+    // Payment was successfully done.
+    if ($order_arca->OrderStatus == 2) {
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message = t('The payment has completed.');
+      $transaction->amount = $order_arca->depositAmount;
+      $transaction->currency_code = COMMERCE_ARCA_CURRENCY;
+      $success = TRUE;
+    }
+    // Some problem occurs during payment.
+    else {
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      if ($order_arca->ErrorCode == 0) {
+        $transaction->message = t('The payment has failed. Please try again later.');
+      }
+      else {
+        $transaction->message = t('!error_message', array(
+          '!error_message' => $order_arca->ErrorMessage,
+        ));
+      }
+    }
+
+    // Save the transaction information.
+    commerce_payment_transaction_save($transaction);
+
+    if ($success) {
+      drupal_set_message($transaction->message);
+      commerce_payment_redirect_pane_next_page($order);
+
+      // Redirect to checkout complete page.
+      $url = 'checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'];
+    }
+    else {
+      drupal_set_message($transaction->message, 'error');
+      commerce_payment_redirect_pane_previous_page($order);
+
+      // Redirect to payments listing page.
+      $url = 'checkout/' . $order->order_id . '/review';
+    }
+
+    drupal_goto($url);
+  }
+  else {
+    return FALSE;
+  }
+}
